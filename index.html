@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Catatan Keuangan</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700;9..40,800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="gaya.css">
+<link rel="manifest" href="manifest.json">
+
+<meta name="theme-color" content="#4f46e5">
+
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Dompetku">
+<link rel="apple-touch-icon" href="icon-192.png">
+
+<!-- Firebase SDK -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import { getFirestore, collection, addDoc, onSnapshot, doc, deleteDoc, updateDoc, query, where, orderBy, Timestamp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+  import { getAuth, signInAnonymously, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyBFUd0PYRVb-KtYSVQn0FvB70LFSmWLY0o",
+    authDomain: "keuangan-9ef89.firebaseapp.com",
+    projectId: "keuangan-9ef89",
+    storageBucket: "keuangan-9ef89.firebasestorage.app",
+    messagingSenderId: "362938577633",
+    appId: "1:362938577633:web:fe39569398258b05767da0"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+  const auth = getAuth(app);
+
+  function hideLoading() {
+    const loader = document.getElementById('loading-overlay');
+    if (loader) {
+      loader.classList.add('hide-loader');
+    }
+  }
+
+  // ---- STATE ----
+  let currentUser = null;
+  let transactions = [];
+  let editingId = null;
+  let unsubscribe = null;
+  let currentFilter = 'monthly';
+  let chartInstance = null;
+  let searchQuery = '';
+
+  // ---- CATEGORIES ----
+  const CATEGORIES = {
+    income: ['Gaji', 'Freelance', 'Investasi', 'Hadiah', 'Penjualan', 'Lainnya'],
+    expense: ['Makanan', 'Transport', 'Belanja', 'Tagihan', 'Hiburan', 'Kesehatan', 'Pendidikan', 'Lainnya']
+  };
+
+  const CAT_ICONS = {
+    'Gaji': '💼', 'Freelance': '💻', 'Investasi': '📈', 'Hadiah': '🎁', 'Penjualan': '🛍️',
+    'Makanan': '🍜', 'Transport': '🚗', 'Belanja': '🛒', 'Tagihan': '📄', 'Hiburan': '🎮',
+    'Kesehatan': '🏥', 'Pendidikan': '📚', 'Lainnya': '📌'
+  };
+
+  const CAT_COLORS = {
+    'Gaji': '#10b981', 'Freelance': '#06b6d4', 'Investasi': '#8b5cf6', 'Hadiah': '#f59e0b', 'Penjualan': '#ec4899',
+    'Makanan': '#f97316', 'Transport': '#3b82f6', 'Belanja': '#ec4899', 'Tagihan': '#6b7280',
+    'Hiburan': '#8b5cf6', 'Kesehatan': '#ef4444', 'Pendidikan': '#14b8a6', 'Lainnya': '#9ca3af'
+  };
+
+  // ---- FORMAT ----
+  const formatRupiah = (n) => new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(n);
+  const formatDate = (ts) => {
+    const d = ts?.toDate ? ts.toDate() : new Date(ts);
+    return d.toLocaleDateString('id-ID', { day: 'numeric', month: 'short', year: 'numeric' });
+  };
+  const todayStr = () => new Date().toISOString().split('T')[0];
+
+  // ---- Friendly Firebase error messages ----
+  function friendlyAuthError(code) {
+    const map = {
+      'auth/invalid-email': 'Format email tidak valid.',
+      'auth/user-disabled': 'Akun ini telah dinonaktifkan.',
+      'auth/user-not-found': 'Email tidak terdaftar.',
+      'auth/wrong-password': 'Password salah.',
+      'auth/invalid-credential': 'Email atau password salah.',
+      'auth/email-already-in-use': 'Email sudah digunakan akun lain.',
+      'auth/weak-password': 'Password terlalu lemah, minimal 6 karakter.',
+      'auth/too-many-requests': 'Terlalu banyak percobaan. Coba lagi nanti.',
+      'auth/network-request-failed': 'Gagal terhubung ke internet.',
+    };
+    return map[code] || 'Terjadi kesalahan. Silakan coba lagi.';
+  }
+
+  // ---- AUTH ----
+  onAuthStateChanged(auth, user => {
+    currentUser = user;
+    if (user) {
+      showApp();
+      subscribeTransactions();
+    } else {
+      showAuth();
+    }
+    setTimeout(hideLoading, 500);
+  });
+
+  // FIX #1: Gunakan querySelector agar tidak crash jika id berubah,
+  //         dan pastikan id="btn-login" ada di HTML
+window.loginUser = async () => {
+  const email = document.getElementById('login-email').value.trim();
+  const pass = document.getElementById('login-pass').value;
+  const err = document.getElementById('auth-error');
+  const btn = document.getElementById('btn-login');
+  err.textContent = '';
+
+  if (!email || !pass) { err.textContent = 'Email dan password wajib diisi.'; return; }
+
+  if (btn) { btn.textContent = 'Memproses...'; btn.disabled = true; }
+
+  try {
+    // HANYA mencoba login, tidak membuat akun baru jika gagal
+    await signInWithEmailAndPassword(auth, email, pass);
+  } catch (e) {
+    // Tampilkan pesan error jika email tidak ada atau password salah
+    err.textContent = "Akses ditolak. Email tidak terdaftar atau password salah.";
+    if (btn) { btn.textContent = 'Masuk'; btn.disabled = false; }
+  }
+};
+
+  // FIX #2: loginAnon juga harus aman jika tombol tidak punya id
+  window.loginAnon = async () => {
+    const btn = document.getElementById('btn-anon');
+    if (btn) { btn.textContent = 'Memproses...'; btn.disabled = true; }
+    try {
+      await signInAnonymously(auth);
+    } catch (e) {
+      document.getElementById('auth-error').textContent = friendlyAuthError(e.code);
+      if (btn) { btn.textContent = 'Masuk Tanpa Akun (Anonim)'; btn.disabled = false; }
+    }
+  };
+
+  window.logoutUser = async () => {
+    if (unsubscribe) unsubscribe();
+    await auth.signOut();
+    transactions = [];
+    searchQuery = '';
+    showAuth();
+  };
+
+  // ---- FIRESTORE SUBSCRIPTION ----
+  function subscribeTransactions() {
+    if (unsubscribe) unsubscribe();
+    const q = query(collection(db, 'transactions'), where('uid', '==', currentUser.uid), orderBy('date', 'desc'));
+    unsubscribe = onSnapshot(q, snap => {
+      transactions = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      renderAll();
+    }, err => {
+      if (err.code === 'failed-precondition') {
+        document.getElementById('index-hint').style.display = 'block';
+      }
+    });
+  }
+
+  // ---- SAVE TRANSACTION ----
+  window.saveTransaction = async () => {
+    const date = document.getElementById('t-date').value;
+    const type = document.getElementById('t-type').value;
+    const nominal = parseFloat(document.getElementById('t-nominal').value.replace(/\D/g, ''));
+    const category = document.getElementById('t-category').value;
+    const note = document.getElementById('t-note').value.trim();
+    const err = document.getElementById('form-error');
+    err.textContent = '';
+
+    if (!date || !nominal || !category) { err.textContent = 'Tanggal, nominal, dan kategori wajib diisi.'; return; }
+    if (isNaN(nominal) || nominal <= 0) { err.textContent = 'Nominal tidak valid.'; return; }
+
+    const data = { uid: currentUser.uid, date: Timestamp.fromDate(new Date(date + 'T00:00:00')), type, nominal, category, note };
+
+    const btn = document.getElementById('save-btn');
+    btn.textContent = 'Menyimpan...';
+    btn.disabled = true;
+
+    try {
+      if (editingId) {
+        await updateDoc(doc(db, 'transactions', editingId), data);
+        editingId = null;
+      } else {
+        await addDoc(collection(db, 'transactions'), data);
+      }
+      resetForm();
+      showPage('dashboard');
+    } catch (e) {
+      err.textContent = 'Gagal menyimpan: ' + e.message;
+    }
+    btn.textContent = 'Simpan';
+    btn.disabled = false;
+  };
+
+  // ---- DELETE ----
+  window.deleteTransaction = async (id) => {
+    if (!confirm('Hapus transaksi ini?')) return;
+    await deleteDoc(doc(db, 'transactions', id));
+  };
+
+  // ---- EDIT ----
+  window.editTransaction = (id) => {
+    const t = transactions.find(x => x.id === id);
+    if (!t) return;
+    editingId = id;
+    const ds = t.date.toDate().toISOString().split('T')[0];
+    document.getElementById('t-date').value = ds;
+    document.getElementById('t-type').value = t.type;
+    // FIX #3: panggil via window agar tidak ReferenceError dari dalam module
+    window._selectTypeSilent(t.type);
+    window.updateCategories();
+    document.getElementById('t-category').value = t.category;
+    document.getElementById('t-nominal').value = t.nominal;
+    document.getElementById('t-note').value = t.note || '';
+    document.getElementById('save-btn').textContent = 'Update';
+    document.getElementById('form-title').textContent = 'Edit Transaksi';
+    showPage('add');
+  };
+
+  // ---- RESET FORM ----
+  function resetForm() {
+    editingId = null;
+    document.getElementById('t-date').value = todayStr();
+    document.getElementById('t-type').value = 'expense';
+    // FIX #3: panggil via window
+    window._selectTypeSilent('expense');
+    window.updateCategories();
+    document.getElementById('t-nominal').value = '';
+    document.getElementById('t-note').value = '';
+    document.getElementById('form-error').textContent = '';
+    document.getElementById('save-btn').textContent = 'Simpan';
+    document.getElementById('form-title').textContent = 'Tambah Transaksi';
+  }
+
+  // updateCategories — satu sumber kebenaran via window
+  window.updateCategories = () => {
+    const type = document.getElementById('t-type').value;
+    const sel = document.getElementById('t-category');
+    sel.innerHTML = '<option value="">Pilih Kategori</option>' +
+      CATEGORIES[type].map(c => `<option value="${c}">${CAT_ICONS[c] || ''} ${c}</option>`).join('');
+  };
+
+  // ---- FILTER ----
+  function getFilteredTransactions() {
+    const now = new Date();
+    return transactions.filter(t => {
+      const d = t.date?.toDate ? t.date.toDate() : new Date(t.date);
+      if (currentFilter === 'daily') {
+        return d.toDateString() === now.toDateString();
+      } else {
+        return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+      }
+    });
+  }
+
+  function getSearchedTransactions() {
+    const filtered = getFilteredTransactions();
+    if (!searchQuery.trim()) return filtered;
+    const q = searchQuery.toLowerCase().trim();
+    return filtered.filter(t =>
+      (t.category || '').toLowerCase().includes(q) ||
+      (t.note || '').toLowerCase().includes(q) ||
+      formatRupiah(t.nominal).includes(q) ||
+      formatDate(t.date).toLowerCase().includes(q)
+    );
+  }
+
+  // setFilter update SEMUA filter-bar sekaligus
+  window.setFilter = (f) => {
+    currentFilter = f;
+    document.querySelectorAll('.filter-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.filter === f);
+    });
+    renderAll();
+  };
+
+  window.onSearchInput = (el) => {
+    searchQuery = el.value;
+    renderHistory();
+  };
+
+  window.clearSearch = () => {
+    searchQuery = '';
+    const inp = document.getElementById('search-input');
+    if (inp) inp.value = '';
+    renderHistory();
+  };
+
+  // ---- RENDER ----
+  function renderAll() {
+    renderDashboard();
+    renderHistory();
+  }
+
+  function renderDashboard() {
+    const filtered = getFilteredTransactions();
+    const income = filtered.filter(t => t.type === 'income').reduce((s, t) => s + t.nominal, 0);
+    const expense = filtered.filter(t => t.type === 'expense').reduce((s, t) => s + t.nominal, 0);
+    const balance = transactions.reduce((s, t) => s + (t.type === 'income' ? t.nominal : -t.nominal), 0);
+
+    document.getElementById('total-balance').textContent = formatRupiah(balance);
+    document.getElementById('total-income').textContent = formatRupiah(income);
+    document.getElementById('total-expense').textContent = formatRupiah(expense);
+    document.getElementById('total-balance').style.color = balance >= 0 ? 'var(--green)' : 'var(--red)';
+
+    renderChart(filtered);
+    renderRecent(filtered.slice(0, 5));
+  }
+
+  function renderChart(data) {
+    const canvas = document.getElementById('chart');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    const expData = {};
+    data.filter(t => t.type === 'expense').forEach(t => {
+      expData[t.category] = (expData[t.category] || 0) + t.nominal;
+    });
+    const labels = Object.keys(expData);
+    const values = Object.values(expData);
+    const colors = labels.map(l => CAT_COLORS[l] || '#9ca3af');
+
+    if (labels.length === 0) {
+      if (chartInstance) {
+        chartInstance.data.labels = [];
+        chartInstance.data.datasets[0].data = [];
+        chartInstance.data.datasets[0].backgroundColor = [];
+        chartInstance.update('active');
+      } else {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#9ca3af';
+        ctx.font = '13px DM Sans';
+        ctx.textAlign = 'center';
+        ctx.fillText('Belum ada pengeluaran', canvas.width / 2, canvas.height / 2);
+      }
+      return;
+    }
+
+    // Update data jika chart sudah ada (tidak destroy/recreate)
+    if (chartInstance) {
+      chartInstance.data.labels = labels;
+      chartInstance.data.datasets[0].data = values;
+      chartInstance.data.datasets[0].backgroundColor = colors;
+      chartInstance.update('active');
+      return;
+    }
+
+    chartInstance = new Chart(ctx, {
+      type: 'doughnut',
+      data: {
+        labels,
+        datasets: [{
+          data: values,
+          backgroundColor: colors,
+          borderWidth: 3,
+          borderColor: '#ffffff',
+          hoverBorderWidth: 0,
+          hoverOffset: 6
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        cutout: '68%',
+        animation: { animateRotate: true, duration: 600, easing: 'easeInOutQuart' },
+        plugins: {
+          legend: {
+            position: 'bottom',
+            labels: {
+              color: '#6b7280',
+              font: { family: 'DM Sans', size: 11, weight: '600' },
+              padding: 14,
+              boxWidth: 10,
+              boxHeight: 10,
+              usePointStyle: true,
+              pointStyle: 'circle'
+            }
+          },
+          tooltip: {
+            callbacks: {
+              label: (c) => '  ' + formatRupiah(c.raw),
+              title: (c) => c[0].label
+            },
+            backgroundColor: '#1e1b4b',
+            titleFont: { family: 'DM Sans', weight: '700', size: 12 },
+            bodyFont: { family: 'DM Mono', size: 12 },
+            padding: 12,
+            cornerRadius: 10
+          }
+        }
+      }
+    });
+  }
+
+  function renderRecent(data) {
+    const el = document.getElementById('recent-list');
+    if (!el) return;
+    if (data.length === 0) {
+      el.innerHTML = '<div class="empty-state"><div class="empty-state-icon">💸</div><p>Belum ada transaksi</p></div>';
+      return;
+    }
+    el.innerHTML = data.map(t => txCard(t, false)).join('');
+  }
+
+  function renderHistory() {
+    const el = document.getElementById('history-list');
+    if (!el) return;
+    const filtered = getSearchedTransactions();
+
+    const counter = document.getElementById('history-count');
+    if (counter) {
+      const total = getFilteredTransactions().length;
+      counter.textContent = filtered.length !== total
+        ? `${filtered.length} dari ${total} transaksi`
+        : `${total} transaksi`;
+    }
+
+    if (filtered.length === 0) {
+      el.innerHTML = `<div class="empty-state">
+        <div class="empty-state-icon">${searchQuery ? '🔍' : '📋'}</div>
+        <p>${searchQuery ? 'Tidak ada transaksi yang cocok' : 'Belum ada transaksi di periode ini'}</p>
+        ${searchQuery ? `<button class="btn-clear-search" onclick="clearSearch()">Hapus pencarian</button>` : ''}
+      </div>`;
+      return;
+    }
+
+    const groups = {};
+    filtered.forEach(t => {
+      const key = formatDate(t.date);
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(t);
+    });
+
+    el.innerHTML = Object.entries(groups).map(([date, txs]) => `
+      <div class="date-group">
+        <div class="date-label">${date}</div>
+        ${txs.map(t => txCard(t, true)).join('')}
+      </div>
+    `).join('');
+  }
+
+  function txCard(t, actions = false) {
+    const isIncome = t.type === 'income';
+    const icon = CAT_ICONS[t.category] || '📌';
+    const color = CAT_COLORS[t.category] || '#9ca3af';
+    return `
+      <div class="tx-card">
+        <div class="tx-icon" style="background:${color}20; color:${color}">${icon}</div>
+        <div class="tx-info">
+          <div class="tx-cat">${t.category}</div>
+          ${t.note ? `<div class="tx-note">${t.note}</div>` : '<div class="tx-note">—</div>'}
+        </div>
+        <div class="tx-right">
+          <div class="tx-amount ${isIncome ? 'income' : 'expense'}">${isIncome ? '+' : '-'}${formatRupiah(t.nominal)}</div>
+          ${actions ? `
+          <div class="tx-actions">
+            <button onclick="editTransaction('${t.id}')" class="btn-edit" title="Edit">✏️</button>
+            <button onclick="deleteTransaction('${t.id}')" class="btn-del" title="Hapus">🗑️</button>
+          </div>` : ''}
+        </div>
+      </div>`;
+  }
+
+  // ---- NAVIGATION ----
+  window.showPage = (page) => {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('page-' + page).classList.add('active');
+    const nb = document.querySelector(`.nav-btn[data-page="${page}"]`);
+    if (nb) nb.classList.add('active');
+    if (page === 'add' && !editingId) resetForm();
+    if (page === 'dashboard') renderDashboard();
+    if (page === 'history') renderHistory();
+  };
+
+  function showAuth() {
+    document.getElementById('auth-screen').style.display = 'flex';
+    document.getElementById('app-screen').style.display = 'none';
+    const btnLogin = document.getElementById('btn-login');
+    if (btnLogin) { btnLogin.textContent = 'Masuk'; btnLogin.disabled = false; }
+  }
+
+  function showApp() {
+    document.getElementById('auth-screen').style.display = 'none';
+    document.getElementById('app-screen').style.display = 'flex';
+    const label = currentUser?.isAnonymous ? 'Anonim' : (currentUser?.email?.split('@')[0] || 'User');
+    document.getElementById('user-label').textContent = label;
+  }
+
+  // ---- NOMINAL FORMAT ----
+  window.formatNominalInput = (el) => {
+    const raw = el.value.replace(/\D/g, '');
+    el.value = raw ? parseInt(raw).toLocaleString('id-ID') : '';
+  };
+
+  // ---- INIT ----
+  document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('t-date').value = todayStr();
+    window.updateCategories();
+    document.getElementById('t-type').addEventListener('change', window.updateCategories);
+    document.getElementById('login-pass').addEventListener('keydown', e => {
+      if (e.key === 'Enter') window.loginUser();
+    });
+    document.getElementById('login-email').addEventListener('keydown', e => {
+      if (e.key === 'Enter') document.getElementById('login-pass').focus();
+    });
+  });
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div id="loading-overlay">
+    <div class="spinner"></div>
+    <div class="loading-text">Berkahi rezekiku, ya Allah</div>
+  </div>
+
+<!-- ===== AUTH SCREEN ===== -->
+<div id="auth-screen">
+  <div class="auth-card">
+    <div class="auth-title">Syukuri Rezeki</div>
+    <div class="auth-sub">Ikhtiar hemat agar bisa sedekah lebih banyak, punya rumah dan mobil sendiri, mudah umroh</div>
+
+    <label class="auth-label">Email</label>
+    <input type="email" id="login-email" class="auth-input" placeholder="email@kamu.com" autocomplete="email">
+
+    <label class="auth-label">Password</label>
+    <input type="password" id="login-pass" class="auth-input" placeholder="Min. 6 karakter" autocomplete="current-password">
+
+    <!-- FIX #1: id="btn-login" WAJIB ada agar JS tidak crash -->
+    <button id="btn-login" class="btn-primary" onclick="loginUser()">Masuk</button>
+
+    <div id="auth-error"></div>
+
+    <div style="margin-top:16px; font-size:11px; color:rgba(255,255,255,0.3); text-align:center; line-height:1.6;">
+      Masukkan email & password yang sama di HP lain untuk sinkronisasi data.
+    </div>
+  </div>
+</div>
+
+<!-- ===== APP SCREEN ===== -->
+<div id="app-screen">
+
+  <!-- Header -->
+  <div class="app-header">
+    <div class="header-top">
+      <div class="app-brand">
+        <div>Catatan keuangan <span>Bismillah, halal dan berkah</span></div>
+      </div>
+      <div class="header-user">
+        <div class="user-avatar" id="user-label">U</div>
+        <button class="btn-logout" onclick="logoutUser()">Keluar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pages -->
+  <div class="pages">
+
+    <!-- DASHBOARD -->
+    <div id="page-dashboard" class="page active">
+      <div id="index-hint">
+        ⚠️ Perlu index di Firestore! Buka Console Firebase → Firestore → Indexes, tambahkan index untuk koleksi <b>transactions</b> dengan field <b>uid (ASC)</b> dan <b>date (DESC)</b>.
+      </div>
+
+      <div class="filter-bar">
+        <button class="filter-btn" data-filter="daily" onclick="setFilter('daily')">Hari Ini</button>
+        <button class="filter-btn active" data-filter="monthly" onclick="setFilter('monthly')">Bulan Ini</button>
+      </div>
+
+      <div class="summary-grid">
+        <div class="summary-card full">
+          <div class="summary-label">Total Saldo Keseluruhan</div>
+          <div class="summary-value" id="total-balance">Rp 0</div>
+        </div>
+        <div class="summary-card income">
+          <div class="summary-label">↑ Pemasukan</div>
+          <div class="summary-value" id="total-income">Rp 0</div>
+        </div>
+        <div class="summary-card expense">
+          <div class="summary-label">↓ Pengeluaran</div>
+          <div class="summary-value" id="total-expense">Rp 0</div>
+        </div>
+      </div>
+
+      <div class="chart-card">
+        <div class="card-title">Pengeluaran per Kategori</div>
+        <div class="chart-wrap"><canvas id="chart"></canvas></div>
+      </div>
+
+      <div class="section-header">
+        <div class="section-title">⏱ Transaksi Terakhir</div>
+      </div>
+      <div id="recent-list"></div>
+      <div class="pb-nav"></div>
+    </div>
+
+    <!-- TAMBAH TRANSAKSI -->
+    <div id="page-add" class="page">
+      <div class="form-card">
+        <div class="form-title" id="form-title">Tambah Transaksi</div>
+
+        <div class="form-group">
+          <label class="form-label">Tanggal</label>
+          <input type="date" id="t-date" class="form-input">
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Jenis Transaksi</label>
+          <div class="type-toggle">
+            <button class="type-btn expense active" onclick="selectType('expense')">Pengeluaran</button>
+            <button class="type-btn income" onclick="selectType('income')">Pemasukan</button>
+          </div>
+          <select id="t-type" style="display:none">
+            <option value="expense">Pengeluaran</option>
+            <option value="income">Pemasukan</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Nominal (Rp)</label>
+          <input type="tel" id="t-nominal" class="form-input" placeholder="0" oninput="formatNominalInput(this)">
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Kategori</label>
+          <select id="t-category" class="form-select"></select>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Catatan (opsional)</label>
+          <input type="text" id="t-note" class="form-input" placeholder="Misal: makan siang, bensin...">
+        </div>
+
+        <div id="form-error"></div>
+        <button id="save-btn" class="btn-save" onclick="saveTransaction()">Simpan</button>
+      </div>
+      <div class="pb-nav"></div>
+    </div>
+
+    <!-- RIWAYAT -->
+    <div id="page-history" class="page">
+      <div class="filter-bar">
+        <button class="filter-btn" data-filter="daily" onclick="setFilter('daily')">Hari Ini</button>
+        <button class="filter-btn active" data-filter="monthly" onclick="setFilter('monthly')">Bulan Ini</button>
+      </div>
+
+      <div class="search-bar">
+        <span class="search-icon">🔍</span>
+        <input
+          type="text"
+          id="search-input"
+          class="search-input"
+          placeholder="Cari kategori, catatan, nominal..."
+          oninput="onSearchInput(this)"
+          autocomplete="off"
+        >
+        <button class="search-clear" id="search-clear-btn" onclick="clearSearch()" title="Hapus">✕</button>
+      </div>
+
+      <div class="history-meta">
+        <span id="history-count" class="history-count">0 transaksi</span>
+      </div>
+
+      <div id="history-list"></div>
+      <div class="pb-nav"></div>
+    </div>
+
+  </div>
+
+  <!-- Bottom Nav -->
+  <nav class="bottom-nav">
+    <button class="nav-btn active" data-page="dashboard" onclick="showPage('dashboard')">
+      <span class="nav-icon">🏠</span>Dashboard
+    </button>
+    <button class="nav-btn add-btn" data-page="add" onclick="showPage('add')">
+      <span class="nav-icon">＋</span>Tambah
+    </button>
+    <button class="nav-btn" data-page="history" onclick="showPage('history')">
+      <span class="nav-icon">📋</span>Riwayat
+    </button>
+  </nav>
+</div>
+
+<script>
+  // FIX #3: Fungsi selectType dan _selectTypeSilent di global scope,
+  //          tapi di-expose ke window agar bisa dipanggil dari ES module
+  function selectType(type) {
+    document.getElementById('t-type').value = type;
+    document.querySelectorAll('.type-btn').forEach(b => {
+      b.classList.toggle('active', b.classList.contains(type));
+    });
+    if (typeof window.updateCategories === 'function') window.updateCategories();
+  }
+
+  // Versi tanpa trigger updateCategories (dipanggil dari dalam module via window._selectTypeSilent)
+  window._selectTypeSilent = function(type) {
+    document.getElementById('t-type').value = type;
+    document.querySelectorAll('.type-btn').forEach(b => {
+      b.classList.toggle('active', b.classList.contains(type));
+    });
+  };
+
+  // Toggle visibility tombol clear search
+  document.addEventListener('DOMContentLoaded', () => {
+    const inp = document.getElementById('search-input');
+    const clearBtn = document.getElementById('search-clear-btn');
+    if (inp && clearBtn) {
+      inp.addEventListener('input', () => {
+        clearBtn.style.opacity = inp.value ? '1' : '0';
+        clearBtn.style.pointerEvents = inp.value ? 'auto' : 'none';
+      });
+    }
+  });
+</script>
+
+</body>
+</html>
